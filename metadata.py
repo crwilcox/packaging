@@ -1,7 +1,6 @@
 from email.parser import HeaderParser
 from metadata import constants
 
-
 def canonicalize(metadata):
     """
     Transforms a metadata object to the canonical representation
@@ -38,6 +37,7 @@ def extract_metadata(string):
                 metadata[key] = []
             metadata[key].append(value)
         elif key in constants.TREAT_AS_MULTI:
+
             metadata[key] = value.split(',')
         else:
             metadata[key] = value
