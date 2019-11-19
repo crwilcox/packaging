@@ -10,12 +10,15 @@ except ImportError:
     ctypes = None
 import distutils.util
 
+import os
 import platform
+import re
 import sys
 import sysconfig
 import types
 import warnings
 
+import pretend
 import pytest
 
 from packaging import tags
@@ -24,6 +27,30 @@ from packaging import tags
 @pytest.fixture
 def example_tag():
     return tags.Tag("py3", "none", "any")
+
+
+@pytest.fixture
+def is_x86():
+    return re.match(r"(i\d86|x86_64)", platform.machine()) is not None
+
+
+@pytest.fixture
+def is_64bit_os():
+    return platform.architecture()[0] == "64bit"
+
+
+@pytest.fixture
+def mock_interpreter_name(monkeypatch):
+    def mock(name):
+        if hasattr(sys, "implementation") and sys.implementation.name != name.lower():
+            monkeypatch.setattr(sys.implementation, "name", name.lower())
+            return True
+        elif platform.python_implementation() != name:
+            monkeypatch.setattr(platform, "python_implementation", lambda: name)
+            return True
+        return False
+
+    return mock
 
 
 def test_tag_lowercasing():
@@ -38,9 +65,19 @@ def test_tag_equality():
     assert tags.Tag(*args) == tags.Tag(*args)
 
 
+def test_tag_equality_fails_with_non_tag():
+    assert not tags.Tag("py3", "none", "any") == "non-tag"
+
+
 def test_tag_hashing(example_tag):
     tags = {example_tag}  # Should not raise TypeError.
     assert example_tag in tags
+
+
+def test_tag_hash_equality(example_tag):
+    equal_tag = tags.Tag("py3", "none", "any")
+    assert example_tag == equal_tag
+    assert example_tag.__hash__() == equal_tag.__hash__()
 
 
 def test_tag_str(example_tag):
@@ -92,9 +129,8 @@ def test_parse_tag_multi_platform():
     "name,expected",
     [("CPython", "cp"), ("PyPy", "pp"), ("Jython", "jy"), ("IronPython", "ip")],
 )
-def test__interpreter_name_cpython(name, expected, monkeypatch):
-    if platform.python_implementation().lower() != name:
-        monkeypatch.setattr(platform, "python_implementation", lambda: name)
+def test__interpreter_name_cpython(name, expected, mock_interpreter_name):
+    mock_interpreter_name(name)
     assert tags._interpreter_name() == expected
 
 
@@ -172,63 +208,71 @@ def test_macos_version_detection(monkeypatch):
 def test_macos_arch_detection(arch, monkeypatch):
     if platform.system() != "Darwin" or platform.mac_ver()[2] != arch:
         monkeypatch.setattr(platform, "mac_ver", lambda: ("10.14", ("", "", ""), arch))
+        monkeypatch.setattr(tags, "_mac_arch", lambda *args: arch)
     assert tags._mac_platforms((10, 14))[0].endswith(arch)
 
 
-def test_cpython_abi_py3(monkeypatch):
-    has_soabi = bool(sysconfig.get_config_var("SOABI"))
-    if platform.python_implementation() != "CPython" or not has_soabi:
-        monkeypatch.setattr(
-            sysconfig, "get_config_var", lambda key: "'cpython-37m-darwin'"
-        )
-    soabi = sysconfig.get_config_var("SOABI").split("-", 2)[1]
-    result = tags._cpython_abi(sys.version_info[:2])
-    assert result == "cp{soabi}".format(soabi=soabi)
+@pytest.mark.parametrize(
+    "py_debug,gettotalrefcount,result",
+    [(1, False, True), (0, False, False), (None, True, True)],
+)
+def test_cpython_abis_debug(py_debug, gettotalrefcount, result, monkeypatch):
+    config = {"Py_DEBUG": py_debug, "WITH_PYMALLOC": 0, "Py_UNICODE_SIZE": 2}
+    monkeypatch.setattr(sysconfig, "get_config_var", config.__getitem__)
+    if gettotalrefcount:
+        monkeypatch.setattr(sys, "gettotalrefcount", 1, raising=False)
+    expected = ["cp37d" if result else "cp37"]
+    assert tags._cpython_abis((3, 7)) == expected
+
+
+def test_cpython_abis_debug_file_extension(monkeypatch):
+    config = {"Py_DEBUG": None}
+    monkeypatch.setattr(sysconfig, "get_config_var", config.__getitem__)
+    monkeypatch.delattr(sys, "gettotalrefcount", raising=False)
+    monkeypatch.setattr(tags, "EXTENSION_SUFFIXES", {"_d.pyd"})
+    assert tags._cpython_abis((3, 8)) == ["cp38d", "cp38"]
 
 
 @pytest.mark.parametrize(
-    "debug,pymalloc,unicode_width",
+    "debug,expected", [(True, ["cp38d", "cp38"]), (False, ["cp38"])]
+)
+def test_cpython_abis_debug_38(debug, expected, monkeypatch):
+    config = {"Py_DEBUG": debug}
+    monkeypatch.setattr(sysconfig, "get_config_var", config.__getitem__)
+    assert tags._cpython_abis((3, 8)) == expected
+
+
+@pytest.mark.parametrize(
+    "pymalloc,version,result",
+    [(1, (3, 7), True), (0, (3, 7), False), (None, (3, 7), True), (1, (3, 8), False)],
+)
+def test_cpython_abis_pymalloc(pymalloc, version, result, monkeypatch):
+    config = {"Py_DEBUG": 0, "WITH_PYMALLOC": pymalloc, "Py_UNICODE_SIZE": 2}
+    monkeypatch.setattr(sysconfig, "get_config_var", config.__getitem__)
+    base_abi = "cp{}{}".format(version[0], version[1])
+    expected = [base_abi + "m" if result else base_abi]
+    assert tags._cpython_abis(version) == expected
+
+
+@pytest.mark.parametrize(
+    "unicode_size,maxunicode,version,result",
     [
-        (False, False, 2),
-        (True, False, 2),
-        (False, True, 2),
-        (False, False, 4),
-        (True, True, 2),
-        (False, True, 4),
-        (True, True, 4),
+        (4, 0x10FFFF, (3, 2), True),
+        (2, 0xFFFF, (3, 2), False),
+        (None, 0x10FFFF, (3, 2), True),
+        (None, 0xFFFF, (3, 2), False),
+        (4, 0x10FFFF, (3, 3), False),
     ],
 )
-def test_cpython_abi_py2(debug, pymalloc, unicode_width, monkeypatch):
-    has_soabi = sysconfig.get_config_var("SOABI")
-    if platform.python_implementation() != "CPython" or has_soabi:
-        diff_debug = debug != sysconfig.get_config_var("Py_DEBUG")
-        diff_malloc = pymalloc != sysconfig.get_config_var("WITH_PYMALLOC")
-        unicode_size = sysconfig.get_config_var("Py_UNICODE_SIZE")
-        diff_unicode_size = unicode_size != unicode_width
-        if diff_debug or diff_malloc or diff_unicode_size:
-            config_vars = {
-                "SOABI": None,
-                "Py_DEBUG": int(debug),
-                "WITH_PYMALLOC": int(pymalloc),
-                "Py_UNICODE_SIZE": unicode_width,
-            }
-            monkeypatch.setattr(sysconfig, "get_config_var", config_vars.__getitem__)
-    else:
-        config_vars = {
-            "SOABI": None,
-            "Py_DEBUG": int(debug),
-            "WITH_PYMALLOC": int(pymalloc),
-            "Py_UNICODE_SIZE": unicode_width,
-        }
-        monkeypatch.setattr(sysconfig, "get_config_var", config_vars.__getitem__)
-    options = ""
-    if debug:
-        options += "d"
-    if pymalloc:
-        options += "m"
-    if unicode_width == 4:
-        options += "u"
-    assert "cp33{}".format(options) == tags._cpython_abi((3, 3))
+def test_cpython_abis_wide_unicode(
+    unicode_size, maxunicode, version, result, monkeypatch
+):
+    config = {"Py_DEBUG": 0, "WITH_PYMALLOC": 0, "Py_UNICODE_SIZE": unicode_size}
+    monkeypatch.setattr(sysconfig, "get_config_var", config.__getitem__)
+    monkeypatch.setattr(sys, "maxunicode", maxunicode)
+    base_abi = "cp{}{}".format(version[0], version[1])
+    expected = [base_abi + "u" if result else base_abi]
+    assert tags._cpython_abis(version) == expected
 
 
 def test_independent_tags():
@@ -254,7 +298,32 @@ def test_independent_tags():
 
 
 def test_cpython_tags():
-    result = list(tags._cpython_tags((3, 3), "cp33", "cp33m", ["plat1", "plat2"]))
+    result = list(
+        tags._cpython_tags((3, 8), "cp38", ["cp38d", "cp38"], ["plat1", "plat2"])
+    )
+    assert result == [
+        tags.Tag("cp38", "cp38d", "plat1"),
+        tags.Tag("cp38", "cp38d", "plat2"),
+        tags.Tag("cp38", "cp38", "plat1"),
+        tags.Tag("cp38", "cp38", "plat2"),
+        tags.Tag("cp38", "abi3", "plat1"),
+        tags.Tag("cp38", "abi3", "plat2"),
+        tags.Tag("cp38", "none", "plat1"),
+        tags.Tag("cp38", "none", "plat2"),
+        tags.Tag("cp37", "abi3", "plat1"),
+        tags.Tag("cp37", "abi3", "plat2"),
+        tags.Tag("cp36", "abi3", "plat1"),
+        tags.Tag("cp36", "abi3", "plat2"),
+        tags.Tag("cp35", "abi3", "plat1"),
+        tags.Tag("cp35", "abi3", "plat2"),
+        tags.Tag("cp34", "abi3", "plat1"),
+        tags.Tag("cp34", "abi3", "plat2"),
+        tags.Tag("cp33", "abi3", "plat1"),
+        tags.Tag("cp33", "abi3", "plat2"),
+        tags.Tag("cp32", "abi3", "plat1"),
+        tags.Tag("cp32", "abi3", "plat2"),
+    ]
+    result = list(tags._cpython_tags((3, 3), "cp33", ["cp33m"], ["plat1", "plat2"]))
     assert result == [
         tags.Tag("cp33", "cp33m", "plat1"),
         tags.Tag("cp33", "cp33m", "plat2"),
@@ -267,19 +336,19 @@ def test_cpython_tags():
     ]
 
 
-def test_sys_tags_on_mac_cpython(monkeypatch):
-    if platform.python_implementation() != "CPython":
-        monkeypatch.setattr(platform, "python_implementation", lambda: "CPython")
-        monkeypatch.setattr(tags, "_cpython_abi", lambda py_version: "cp33m")
+def test_sys_tags_on_mac_cpython(mock_interpreter_name, monkeypatch):
+    if mock_interpreter_name("CPython"):
+        monkeypatch.setattr(tags, "_cpython_abis", lambda *a: ["cp33m"])
     if platform.system() != "Darwin":
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(tags, "_mac_platforms", lambda: ["macosx_10_5_x86_64"])
-    abi = tags._cpython_abi(sys.version_info[:2])
+    abis = tags._cpython_abis(sys.version_info[:2])
     platforms = tags._mac_platforms()
     result = list(tags.sys_tags())
+    assert len(abis) == 1
     assert result[0] == tags.Tag(
         "cp{major}{minor}".format(major=sys.version_info[0], minor=sys.version_info[1]),
-        abi,
+        abis[0],
         platforms[0],
     )
     assert result[-1] == tags.Tag("py{}0".format(sys.version_info[0]), "none", "any")
@@ -315,9 +384,8 @@ def test_pypy_interpreter(monkeypatch):
     assert expected == tags._pypy_interpreter()
 
 
-def test_pypy_tags(monkeypatch):
-    if platform.python_implementation() != "PyPy":
-        monkeypatch.setattr(platform, "python_implementation", lambda: "PyPy")
+def test_pypy_tags(mock_interpreter_name, monkeypatch):
+    if mock_interpreter_name("PyPy"):
         monkeypatch.setattr(tags, "_pypy_interpreter", lambda: "pp360")
     interpreter = tags._pypy_interpreter()
     result = list(tags._pypy_tags((3, 3), interpreter, "pypy3_60", ["plat1", "plat2"]))
@@ -329,9 +397,8 @@ def test_pypy_tags(monkeypatch):
     ]
 
 
-def test_sys_tags_on_mac_pypy(monkeypatch):
-    if platform.python_implementation() != "PyPy":
-        monkeypatch.setattr(platform, "python_implementation", lambda: "PyPy")
+def test_sys_tags_on_mac_pypy(mock_interpreter_name, monkeypatch):
+    if mock_interpreter_name("PyPy"):
         monkeypatch.setattr(tags, "_pypy_interpreter", lambda: "pp360")
     if platform.system() != "Darwin":
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
@@ -379,20 +446,20 @@ def test_generic_tags():
     ]
 
 
-def test_sys_tags_on_windows_cpython(monkeypatch):
-    if platform.python_implementation() != "CPython":
-        monkeypatch.setattr(platform, "python_implementation", lambda: "CPython")
-        monkeypatch.setattr(tags, "_cpython_abi", lambda py_version: "cp33m")
+def test_sys_tags_on_windows_cpython(mock_interpreter_name, monkeypatch):
+    if mock_interpreter_name("CPython"):
+        monkeypatch.setattr(tags, "_cpython_abis", lambda *a: ["cp33m"])
     if platform.system() != "Windows":
         monkeypatch.setattr(platform, "system", lambda: "Windows")
         monkeypatch.setattr(tags, "_generic_platforms", lambda: ["win_amd64"])
-    abi = tags._cpython_abi(sys.version_info[:2])
+    abis = tags._cpython_abis(sys.version_info[:2])
     platforms = tags._generic_platforms()
     result = list(tags.sys_tags())
     interpreter = "cp{major}{minor}".format(
         major=sys.version_info[0], minor=sys.version_info[1]
     )
-    expected = tags.Tag(interpreter, abi, platforms[0])
+    assert len(abis) == 1
+    expected = tags.Tag(interpreter, abis[0], platforms[0])
     assert result[0] == expected
     expected = tags.Tag("py{}0".format(sys.version_info[0]), "none", "any")
     assert result[-1] == expected
@@ -467,11 +534,53 @@ def test_glibc_version_string(version_str, expected, monkeypatch):
 
     process_namespace = ProcessNamespace(LibcVersion(version_str))
     monkeypatch.setattr(ctypes, "CDLL", lambda _: process_namespace)
+    monkeypatch.setattr(tags, "_glibc_version_string_confstr", lambda: False)
 
     assert tags._glibc_version_string() == expected
 
     del process_namespace.gnu_get_libc_version
     assert tags._glibc_version_string() is None
+
+
+def test_glibc_version_string_confstr(monkeypatch):
+    monkeypatch.setattr(os, "confstr", lambda x: "glibc 2.20", raising=False)
+    assert tags._glibc_version_string_confstr() == "2.20"
+
+
+@pytest.mark.parametrize(
+    "failure", [pretend.raiser(ValueError), pretend.raiser(OSError), lambda x: "XXX"]
+)
+def test_glibc_version_string_confstr_fail(monkeypatch, failure):
+    monkeypatch.setattr(os, "confstr", failure, raising=False)
+    assert tags._glibc_version_string_confstr() is None
+
+
+def test_glibc_version_string_confstr_missing(monkeypatch):
+    monkeypatch.delattr(os, "confstr", raising=False)
+    assert tags._glibc_version_string_confstr() is None
+
+
+def test_glibc_version_string_ctypes_missing(monkeypatch):
+    monkeypatch.setitem(sys.modules, "ctypes", None)
+    assert tags._glibc_version_string_ctypes() is None
+
+
+def test_get_config_var_does_not_log(monkeypatch):
+    debug = pretend.call_recorder(lambda *a: None)
+    monkeypatch.setattr(tags.logger, "debug", debug)
+    tags._get_config_var("missing")
+    assert debug.calls == []
+
+
+def test_get_config_var_does_log(monkeypatch):
+    debug = pretend.call_recorder(lambda *a: None)
+    monkeypatch.setattr(tags.logger, "debug", debug)
+    tags._get_config_var("missing", warn=True)
+    assert debug.calls == [
+        pretend.call(
+            "Config variable '%s' is unset, Python ABI tag may be incorrect", "missing"
+        )
+    ]
 
 
 def test_have_compatible_glibc(monkeypatch):
@@ -486,22 +595,27 @@ def test_have_compatible_glibc(monkeypatch):
     assert not tags._have_compatible_glibc(2, 4)
 
 
-def test_linux_platforms_64bit_on_64bit_os(monkeypatch):
-    is_64bit_os = distutils.util.get_platform().endswith("_x86_64")
-    if platform.system() != "Linux" or not is_64bit_os:
+def test_linux_platforms_64bit_on_64bit_os(is_64bit_os, is_x86, monkeypatch):
+    if platform.system() != "Linux" or not is_64bit_os or not is_x86:
         monkeypatch.setattr(distutils.util, "get_platform", lambda: "linux_x86_64")
         monkeypatch.setattr(tags, "_is_manylinux_compatible", lambda *args: False)
     linux_platform = tags._linux_platforms(is_32bit=False)[-1]
     assert linux_platform == "linux_x86_64"
 
 
-def test_linux_platforms_32bit_on_64bit_os(monkeypatch):
-    is_64bit_os = distutils.util.get_platform().endswith("_x86_64")
-    if platform.system() != "Linux" or not is_64bit_os:
+def test_linux_platforms_32bit_on_64bit_os(is_64bit_os, is_x86, monkeypatch):
+    if platform.system() != "Linux" or not is_64bit_os or not is_x86:
         monkeypatch.setattr(distutils.util, "get_platform", lambda: "linux_x86_64")
         monkeypatch.setattr(tags, "_is_manylinux_compatible", lambda *args: False)
     linux_platform = tags._linux_platforms(is_32bit=True)[-1]
     assert linux_platform == "linux_i686"
+
+
+def test_linux_platforms_manylinux_unsupported(monkeypatch):
+    monkeypatch.setattr(distutils.util, "get_platform", lambda: "linux_x86_64")
+    monkeypatch.setattr(tags, "_is_manylinux_compatible", lambda *args: False)
+    linux_platform = tags._linux_platforms(is_32bit=False)
+    assert linux_platform == ["linux_x86_64"]
 
 
 def test_linux_platforms_manylinux1(monkeypatch):
@@ -525,20 +639,36 @@ def test_linux_platforms_manylinux2010(monkeypatch):
     assert platforms == expected
 
 
-def test_sys_tags_linux_cpython(monkeypatch):
-    if platform.python_implementation() != "CPython":
-        monkeypatch.setattr(platform, "python_implementation", lambda: "CPython")
-        monkeypatch.setattr(tags, "_cpython_abi", lambda py_version: "cp33m")
+def test_linux_platforms_manylinux2014(monkeypatch):
+    monkeypatch.setattr(
+        tags, "_is_manylinux_compatible", lambda name, _: name == "manylinux2014"
+    )
+    if platform.system() != "Linux":
+        monkeypatch.setattr(distutils.util, "get_platform", lambda: "linux_x86_64")
+    platforms = tags._linux_platforms(is_32bit=False)
+    expected = [
+        "manylinux2014_x86_64",
+        "manylinux2010_x86_64",
+        "manylinux1_x86_64",
+        "linux_x86_64",
+    ]
+    assert platforms == expected
+
+
+def test_sys_tags_linux_cpython(mock_interpreter_name, monkeypatch):
+    if mock_interpreter_name("CPython"):
+        monkeypatch.setattr(tags, "_cpython_abis", lambda *a: ["cp33m"])
     if platform.system() != "Linux":
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         monkeypatch.setattr(tags, "_linux_platforms", lambda: ["linux_x86_64"])
-    abi = tags._cpython_abi(sys.version_info[:2])
+    abis = tags._cpython_abis(sys.version_info[:2])
     platforms = tags._linux_platforms()
     result = list(tags.sys_tags())
     expected_interpreter = "cp{major}{minor}".format(
         major=sys.version_info[0], minor=sys.version_info[1]
     )
-    assert result[0] == tags.Tag(expected_interpreter, abi, platforms[0])
+    assert len(abis) == 1
+    assert result[0] == tags.Tag(expected_interpreter, abis[0], platforms[0])
     expected = tags.Tag("py{}0".format(sys.version_info[0]), "none", "any")
     assert result[-1] == expected
 
